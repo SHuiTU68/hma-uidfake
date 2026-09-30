@@ -186,6 +186,23 @@ and pushes it in the same step -- a config the daemon would refuse is never left
 device the page runs `sync-tool` through the manager's own `ksu.exec`, so nothing has to be a root
 shell over the network.
 
+The page is a home list over sub-screens: a card of kernel status, then Manage apps, Templates,
+Backup and restore, How it works, Settings and About. Manage apps is a searchable list of every
+installed app (filtered by user/system/with-a-rule), each row carrying a switch that adds or removes
+that app's rule; opening a row gives the rule's mode, its `hide_all` and `hide_system`, its own
+`hide` list and the templates it applies, drawn from the same app list. A template is a named list of
+apps, so renaming or deleting one follows through to every rule that references it -- a rule left
+pointing at a name that no longer exists would hide less than its author sees. Settings holds the
+theme and the module-wide `mode` and `hide_system`, which are the default for apps that do not
+override them.
+
+The screens follow the layout of the HMA-OSS app, because a user coming from it already knows these
+settings in that shape. Nothing is taken from it: HMA-OSS is AGPL-3.0 and this module is GPL-2.0, and
+its UI is Kotlin against Compose and Fragments rather than a page, so there is no code here to reuse
+even if the licences allowed it. What that app offers and a kernel-side uid guard cannot honour --
+icon and launcher hiding, per-hook switches, logs, an accessibility service -- is left out rather than
+shown as a switch that would do nothing.
+
 ## Protocol
 
 Little endian, defined once in `include/kaux.h`, which the module and the tool both include. The

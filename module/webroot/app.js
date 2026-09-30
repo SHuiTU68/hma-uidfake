@@ -1,12 +1,19 @@
 /*
- * The page's logic, and its whole job.
+ * The WebUI's logic.
  *
  * It does not parse a config, decide a rule or hold one: every read comes from
  * sync-tool (--status, --packages, --get-config) and every write goes back
  * through it (--set-config), so the page and the running policy cannot disagree
  * about which format a file is in. The tool is the one place that reads and
  * writes the config, and it validates before it writes. What is left here is the
- * shape of a phone screen over that.
+ * shape of a phone screen over that: a home list, a searchable app list, a
+ * per-app rule, and templates.
+ *
+ * The screens follow HMA-OSS's layout because these settings are already
+ * familiar in that shape. Nothing is copied from it: it is AGPL-3.0 and Kotlin,
+ * this is GPL-2.0 and a web page. What it has that a kernel-side uid guard
+ * cannot honour -- icon/launcher hiding, per-hook switches, logs, accessibility
+ * -- is left out rather than shown as a switch that would do nothing.
  */
 
 "use strict";
@@ -14,6 +21,8 @@
 const MODULE_DIR = "/data/adb/modules/hma-uidfake";
 const TOOL = MODULE_DIR + "/sync-tool";
 const TMP = "/data/local/tmp/hma-uidfake-webui.json";
+const THEME_KEY = "hma-uidfake.theme";
+const REPO_URL = "https://github.com/SHuiTU68/hma-uidfake";
 
 /* ---- talking to sync-tool ---- */
 
@@ -27,7 +36,7 @@ function hasRoot() {
 function execRaw(command) {
   return new Promise((resolve, reject) => {
     if (!hasRoot()) {
-      reject(new Error("this page needs the KernelSU manager: no ksu.exec"));
+      reject(new Error("no ksu.exec: open this page from the KernelSU manager"));
       return;
     }
     let done = false;
@@ -47,7 +56,11 @@ function execRaw(command) {
         });
         return;
       }
-      resolve({ errno: 0, stdout: String(data == null ? "" : data), stderr: "" });
+      resolve({
+        errno: 0,
+        stdout: String(data == null ? "" : data),
+        stderr: "",
+      });
     };
     try {
       const r = ksu.exec(command);
@@ -59,8 +72,8 @@ function execRaw(command) {
   });
 }
 
-/* One sync-tool command whose stdout is one JSON document. A non-zero exit or a
- * body that does not parse is raised, never half-read. */
+/* One sync-tool command whose stdout is a single JSON document. A non-zero exit
+ * or a body that does not parse is raised, never half-read. */
 async function runJson(command) {
   const r = await execRaw(command);
   const text = (r.stdout || "").trim();
@@ -102,17 +115,92 @@ const api = {
         " --set-config < " + TMP,
     );
   },
+  version: async () => {
+    const out = await runOk("sed -n 's/^version=//p' " + MODULE_DIR + "/module.prop");
+    return (out || "").trim();
+  },
 };
 
-/* ---- what the page holds ---- */
+/* ---- icons ---- */
+
+/* Drawn here rather than taken from anywhere: four shapes are all this page
+ * needs, and a font or a sprite would be more to ship. */
+const ICONS = {
+  back: "M15 5l-7 7 7 7",
+  next: "M9 5l7 7-7 7",
+  search: "M11 4a7 7 0 105 12A7 7 0 0011 4zm5 12l4 4",
+  more: "M6 12h.01M12 12h.01M18 12h.01",
+  shield: "M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6z",
+  apps: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  layers: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5",
+  gear: "M12 9a3 3 0 100 6 3 3 0 000-6zM4 12H2m20 0h-2M12 4V2m0 20v-2",
+  info: "M12 3a9 9 0 100 18 9 9 0 000-18zm0 5v.01M12 11v6",
+  save: "M12 3v12m0 0l-4-4m4 4l4-4M4 19h16",
+  restore: "M12 21V9m0 0L8 13m4-4l4 4M4 5h16",
+  help: "M12 3a9 9 0 100 18 9 9 0 000-18zm0 13v.01M9.5 9.5a2.5 2.5 0 114 2c-.8.7-1.5 1-1.5 2",
+  plus: "M12 5v14M5 12h14",
+  trash: "M4 7h16M9 7V5h6v2m-8 0l1 13h8l1-13",
+  edit: "M4 20h4L20 8l-4-4L4 16z",
+  check: "M4 12l5 5L20 6",
+  sun: "M12 7a5 5 0 100 10 5 5 0 000-10zM12 2v2m0 16v2M2 12h2m16 0h2M5 5l1 1m12 12l1 1M19 5l-1 1M6 18l-1 1",
+  filter: "M4 6h16M7 12h10M10 18h4",
+  code: "M9 8l-4 4 4 4M15 8l4 4-4 4",
+};
+
+function icon(name, cls) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.9");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  if (cls) svg.setAttribute("class", cls);
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICONS[name] || "");
+  svg.append(path);
+  return svg;
+}
+
+/* ---- state ---- */
 
 const state = {
+  loaded: false,
+  failed: null,
   status: null,
   packages: [],
-  config: { version: 2, mode: "blacklist", hide_system: false, templates: {}, apps: {} },
-  ready: false,
-  editor: null, // {kind:"caller"|"template", key, entry}
+  config: null,
+  version: "",
+  stack: [{ screen: "home", param: null }],
+  /* list screen controls */
+  query: "",
+  filter: "all",
+  sort: "package",
+  reverse: false,
 };
+
+function screen() {
+  return state.stack[state.stack.length - 1];
+}
+
+function go(name, param) {
+  state.stack.push({ screen: name, param: param === undefined ? null : param });
+  render();
+  window.scrollTo(0, 0);
+}
+
+function back() {
+  if (state.stack.length > 1) state.stack.pop();
+  render();
+  window.scrollTo(0, 0);
+}
+
+/* Jump back to a screen that is already below, so Home does not pile up. */
+function goRoot(name) {
+  state.stack = [{ screen: name, param: null }];
+  render();
+  window.scrollTo(0, 0);
+}
 
 /* ---- small helpers ---- */
 
@@ -127,13 +215,13 @@ function el(tag, className, text) {
   return node;
 }
 
-let toastTimer = null;
+let snackTimer = null;
 function toast(message, kind) {
-  const box = $("toast");
+  const box = $("snackbar");
   box.textContent = message;
-  box.className = "toast" + (kind ? " " + kind : "");
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => box.classList.add("hidden"), 2600);
+  box.className = "snackbar" + (kind ? " " + kind : "");
+  if (snackTimer) clearTimeout(snackTimer);
+  snackTimer = setTimeout(() => box.classList.add("hidden"), 2800);
 }
 
 let busyCount = 0;
@@ -143,7 +231,7 @@ function busy(on) {
   $("busy").classList.toggle("hidden", busyCount === 0);
 }
 
-/* Wrap a mutating action so every path gets the spinner and the toast. */
+/* Wrap a mutating action so every path gets the spinner and the snackbar. */
 async function guard(label, fn) {
   busy(true);
   try {
@@ -155,487 +243,1255 @@ async function guard(label, fn) {
   }
 }
 
-/* ---- status ---- */
+function pkgInfo(name) {
+  for (const p of state.packages) if (p.name === name) return p;
+  return null;
+}
 
-const KIND = { native: "native", hma: "hma", hmaoss: "hma-oss" };
+function templateCount(name) {
+  const list = (state.config && state.config.templates) || {};
+  return (list[name] || []).length;
+}
 
-function renderStatus() {
-  const wrap = $("status-cards");
-  wrap.replaceChildren();
-  const st = state.status;
-  if (!st) {
-    wrap.append(el("div", "empty", "Loading…"));
-    return;
+function entryOf(caller) {
+  const apps = (state.config && state.config.apps) || {};
+  return apps[caller] || null;
+}
+
+/* How many apps a caller entry actually hides, templates counted through. */
+function hiddenCount(caller) {
+  const e = entryOf(caller);
+  if (!e) return 0;
+  const set = new Set(e.hide || []);
+  for (const t of e.templates || []) {
+    for (const p of (state.config.templates || {})[t] || []) set.add(p);
   }
+  return set.size;
+}
 
-  const sourceLabel = st.source === "none" ? "none (module idle)" : st.source;
-  const sourceCard = el("div", "card");
-  sourceCard.append(el("div", "k", "Rule source"));
-  const v = el("div", "v small", sourceLabel);
-  sourceCard.append(v);
-  if (st.source === "none") sourceCard.classList.add("warn");
-  wrap.append(sourceCard);
+function entrySummary(caller) {
+  const e = entryOf(caller);
+  if (!e) return "";
+  if (e.hide_all) return "hide everything";
+  const n = hiddenCount(caller);
+  const t = (e.templates || []).length;
+  if (n === 0 && t === 0) return "nothing hidden yet";
+  const bits = [];
+  if (n) bits.push(n + " app" + (n === 1 ? "" : "s"));
+  if (t) bits.push(t + " template" + (t === 1 ? "" : "s"));
+  return bits.join(" + ");
+}
 
-  const pairs = el("div", "card");
-  pairs.append(el("div", "k", "Pairs pushed"));
-  pairs.append(el("div", "v", String(st.rules || 0)));
-  wrap.append(pairs);
+function avatar(text) {
+  const box = el("div", "lead");
+  const name = (text || "?").split(".").pop() || "?";
+  box.textContent = name.slice(0, 1).toUpperCase();
+  return box;
+}
 
-  const k = st.kernel;
-  if (k) {
-    const native = el("div", "card" + (k.native > 0 ? " ok" : ""));
-    native.append(el("div", "k", "Hooked (native)"));
-    native.append(el("div", "v", String(k.native)));
-    wrap.append(native);
+function switch_(checked, onChange) {
+  const label = el("label", "switch");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = !!checked;
+  input.addEventListener("change", () => onChange(input.checked));
+  /* A switch often sits on a row that is itself tappable. Flipping one must
+   * not also open the screen behind it, so the tap stops here. */
+  label.addEventListener("click", (ev) => ev.stopPropagation());
+  label.append(input, document.createElement("i"));
+  return label;
+}
 
-    const compat = el("div", "card");
-    compat.append(el("div", "k", "Hooked (compat)"));
-    compat.append(el("div", "v", String(k.compat)));
-    wrap.append(compat);
-
-    const apk = el(
-      "div",
-      "card" + (k.apk_failed > 0 ? " warn" : k.apk_inodes > 0 ? " ok" : ""),
-    );
-    apk.append(el("div", "k", "APK inodes"));
-    apk.append(el("div", "v", String(k.apk_inodes)));
-    if (k.apk_failed_total)
-      apk.append(el("div", "meta", k.apk_failed_total + " failed total"));
-    wrap.append(apk);
-
-    const lsm = el("div", "card" + (k.lsm_state ? " ok" : " warn"));
-    lsm.append(el("div", "k", "LSM setuid"));
-    lsm.append(el("div", "v", k.lsm_state ? "on" : "off"));
-    wrap.append(lsm);
-
-    const arch = el("div", "card");
-    arch.append(el("div", "k", "Kernel"));
-    arch.append(
-      el("div", "v small", `va_bits ${k.va_bits}, page ${1 << k.page_shift}`),
-    );
-    wrap.append(arch);
-
-    if (k.last_error) {
-      const err = el("div", "card bad");
-      err.append(el("div", "k", "Last error"));
-      err.append(el("div", "v small", String(k.last_error)));
-      wrap.append(err);
-    }
-  } else {
-    const note = el("div", "card warn");
-    note.append(el("div", "k", "Kernel"));
-    note.append(el("div", "v small", st.kernel_note || "unavailable"));
-    wrap.append(note);
+function chips(values, active, onPick) {
+  const row = el("div", "chiprow");
+  for (const v of values) {
+    const b = el("button", "chip", v.label);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(v.id === active));
+    b.addEventListener("click", () => onPick(v.id));
+    row.append(b);
   }
-
-  $("subtitle").textContent = k
-    ? `${st.rules} pair(s) · source ${sourceLabel}`
-    : `source ${sourceLabel}`;
+  return row;
 }
 
-/* ---- apps ---- */
-
-function packageByName(name) {
-  return state.packages.find((p) => p.name === name) || null;
+function searchBar(value, placeholder, onInput) {
+  const box = el("div", "search");
+  box.append(icon("search"));
+  const input = document.createElement("input");
+  input.type = "search";
+  input.value = value || "";
+  input.placeholder = placeholder;
+  input.addEventListener("input", () => onInput(input.value));
+  box.append(input);
+  return box;
 }
 
-function ruleCount() {
-  return Object.keys(state.config.apps || {}).length;
-}
-
-function renderApps() {
-  const list = $("app-list");
-  list.replaceChildren();
-  const search = $("app-search").value.trim().toLowerCase();
-  const filter = $("app-filter").value;
-  const apps = state.config.apps || {};
-
-  let rows = state.packages;
-  if (filter === "callers")
-    rows = rows.filter((p) => Object.prototype.hasOwnProperty.call(apps, p.name));
-  else if (filter === "user") rows = rows.filter((p) => !p.system);
-
-  if (search)
-    rows = rows.filter(
-      (p) =>
-        p.name.toLowerCase().includes(search) ||
-        String(p.uid).includes(search),
-    );
-
-  $("apps-hint").textContent =
-    `${rows.length} shown · ${rowCountLabel(ruleCount(), "rule")} · ` +
-    `${rowCountLabel(state.packages.length, "app")}`;
-
-  if (!rows.length) {
-    list.append(el("li", "empty", "No packages match."));
-    return;
-  }
-
-  for (const p of rows) {
-    const li = el("li", "tappable");
-    const name = el("div", "name");
-    name.append(el("span", "pkg", p.name));
-    name.append(el("span", "meta", "uid " + p.uid + (p.system ? " · system" : "")));
-    li.append(name);
-
-    if (Object.prototype.hasOwnProperty.call(apps, p.name))
-      li.append(el("span", "badge on", "rule"));
-    if (p.system) li.append(el("span", "badge sys", "system"));
-
-    li.addEventListener("click", () => openCaller(p.name));
-    list.append(li);
-  }
-}
-
-function rowCountLabel(n, word) {
-  return n + " " + word + (n === 1 ? "" : "s");
-}
-
-/* ---- templates ---- */
-
-function renderTemplates() {
-  const list = $("tpl-list");
-  list.replaceChildren();
-  const templates = state.config.templates || {};
-  const names = Object.keys(templates).sort();
-
-  if (!names.length) {
-    list.append(el("li", "empty", "No templates yet."));
-    return;
-  }
-
-  for (const name of names) {
-    const members = Array.isArray(templates[name]) ? templates[name] : [];
-    const li = el("li", "tappable");
-    const box = el("div", "name");
-    box.append(el("span", "pkg", name));
-    box.append(el("span", "meta", rowCountLabel(members.length, "package")));
-    li.append(box);
-    li.append(el("span", "badge", "template"));
-    li.addEventListener("click", () => openTemplate(name));
-    list.append(li);
-  }
-}
-
-/* ---- the editor ---- */
-
-function isWhitelist(entry) {
-  const mode = entry && entry.mode ? entry.mode : state.config.mode;
-  return mode === "whitelist";
-}
-
-function entryHide(entry) {
-  return entry && Array.isArray(entry.hide) ? entry.hide.slice() : [];
-}
-
-function entryTemplates(entry) {
-  return entry && Array.isArray(entry.templates) ? entry.templates.slice() : [];
-}
-
-function openCaller(name) {
-  const entry = (state.config.apps || {})[name];
-  state.editor = {
-    kind: "caller",
-    key: name,
-    entry: entry ? JSON.parse(JSON.stringify(entry)) : {},
-  };
-  renderEditor();
-  $("editor").classList.remove("hidden");
-}
-
-function openTemplate(name) {
-  const members = (state.config.templates || {})[name];
-  state.editor = {
-    kind: "template",
-    key: name,
-    entry: { hide: Array.isArray(members) ? members.slice() : [] },
-  };
-  renderEditor();
-  $("editor").classList.remove("hidden");
-}
-
-function closeEditor() {
-  state.editor = null;
-  $("editor").classList.add("hidden");
-}
-
-function renderEditor() {
-  const ed = state.editor;
-  if (!ed) return;
-  const list = $("editor-list");
-  list.replaceChildren();
-
-  const isCaller = ed.kind === "caller";
-  $("editor-title").textContent = ed.key;
-
-  /* The controls only exist for a caller; a template is a package list alone. */
-  $("editor-all").parentElement.classList.toggle("hidden", !isCaller);
-  $("editor-whitelist").parentElement.classList.toggle("hidden", !isCaller);
-  $("editor-system").parentElement.classList.toggle("hidden", !isCaller);
-  $("editor-remove").classList.toggle("hidden", !isCaller);
-  $("editor-remove").textContent =
-    isCaller && (state.config.apps || {})[ed.key] ? "Remove rule" : "Clear";
-
-  if (isCaller) {
-    $("editor-whitelist").checked = isWhitelist(ed.entry);
-    $("editor-all").checked = ed.entry.hide_all === true;
-    $("editor-system").checked =
-      ed.entry.hide_system === undefined
-        ? state.config.hide_system === true
-        : ed.entry.hide_system === true;
-  }
-
-  const whitelist = isCaller && isWhitelist(ed.entry);
-  $("editor-hint").textContent = !isCaller
-    ? "The packages this template hides for every caller that applies it."
-    : whitelist
-      ? "Whitelist: checked packages stay visible; everything else is hidden."
-      : "Blacklist: checked packages are hidden from this caller.";
-
-  const search = $("editor-search").value.trim().toLowerCase();
-  const hide = new Set(entryHide(ed.entry));
-  const applied = new Set(isCaller ? entryTemplates(ed.entry) : []);
-  /* Every package, plus — for a caller — the templates, so both halves of a
-   * rule are editable in one place. */
-  const rows = [...state.packages];
-
-  if (search && !isCaller) {
-    /* Templates have no rows of their own below; filter the package list. */
-  }
-
-  if (search)
-    rows.length = 0,
-      state.packages.forEach((p) => {
-        if (p.name.toLowerCase().includes(search) || String(p.uid).includes(search))
-          rows.push(p);
-      });
-
-  if (isCaller && !search) {
-    const tplNames = Object.keys(state.config.templates || {}).sort();
-    for (const t of tplNames) {
-      const li = el("li");
-      const box = el("div", "name");
-      box.append(el("span", "pkg", t));
-      box.append(el("span", "meta", "template"));
-      li.append(box);
-      const chk = document.createElement("input");
-      chk.type = "checkbox";
-      chk.style.width = "18px";
-      chk.style.height = "18px";
-      chk.style.accentColor = "var(--accent)";
-      chk.checked = applied.has(t);
-      chk.addEventListener("change", () => {
-        if (chk.checked) applied.add(t);
-        else applied.delete(t);
-        ed.entry.templates = [...applied];
-      });
-      li.append(chk);
-      list.append(li);
-    }
-  }
-
-  for (const p of rows) {
-    const li = el("li");
-    const box = el("div", "name");
-    box.append(el("span", "pkg", p.name));
-    box.append(el("span", "meta", "uid " + p.uid + (p.system ? " · system" : "")));
-    li.append(box);
-    const chk = document.createElement("input");
-    chk.type = "checkbox";
-    chk.style.width = "18px";
-    chk.style.height = "18px";
-    chk.style.accentColor = "var(--accent)";
-    chk.checked = hide.has(p.name);
-    chk.addEventListener("change", () => {
-      if (chk.checked) hide.add(p.name);
-      else hide.delete(p.name);
-      ed.entry.hide = [...hide];
+/* A row is a div rather than a button because a row can carry a switch, and an
+ * input inside a button is neither valid nor reliable: the browser would send
+ * the label's tap to the button as well. Keyboard access is added by hand
+ * instead, so a tappable row still answers to Enter and Space. */
+function row(opts) {
+  const node = el("div", opts.onClick ? "row clickable" : "row");
+  if (opts.onClick) {
+    node.setAttribute("role", "button");
+    node.setAttribute("tabindex", "0");
+    node.addEventListener("click", opts.onClick);
+    node.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        opts.onClick();
+      }
     });
-    li.append(chk);
-    list.append(li);
   }
-
-  if (!list.children.length)
-    list.append(el("li", "empty", "No packages match."));
-}
-
-function saveEditor() {
-  const ed = state.editor;
-  if (!ed) return;
-  const hide = entryHide(ed.entry);
-
-  if (ed.kind === "template") {
-    state.config.templates = state.config.templates || {};
-    const name = ed.key;
-    const members = ed.entry.hide || [];
-    if (!members.length) delete state.config.templates[name];
-    else state.config.templates[name] = members;
-    return persist("Template saved");
+  if (opts.lead) node.append(opts.lead);
+  const main = el("div", "main");
+  const title = el("div", "title");
+  if (Array.isArray(opts.title)) title.append(...opts.title);
+  else title.textContent = opts.title || "";
+  main.append(title);
+  if (opts.sub) {
+    const sub = el("div", "sub" + (opts.subMono ? " mono" : ""), opts.sub);
+    main.append(sub);
   }
-
-  const apps = state.config.apps || (state.config.apps = {});
-  const entry = {};
-  const whitelist = $("editor-whitelist").checked;
-  const hideAll = $("editor-all").checked;
-  const system = $("editor-system").checked;
-
-  if (whitelist !== (state.config.mode === "whitelist"))
-    entry.mode = whitelist ? "whitelist" : "blacklist";
-  if (hideAll) entry.hide_all = true;
-  if (system !== (state.config.hide_system === true)) entry.hide_system = system;
-  const templates = entryTemplates(ed.entry);
-  if (templates.length) entry.templates = templates;
-  if (hide.length) entry.hide = hide;
-
-  /* An entry that says nothing is the same as no entry: it is dropped, so the
-   * config does not grow a rule per package that was looked at. */
-  if (Object.keys(entry).length === 0) delete apps[ed.key];
-  else apps[ed.key] = entry;
-
-  persist("Rule saved");
-}
-
-function removeEditor() {
-  const ed = state.editor;
-  if (!ed || ed.kind !== "caller") {
-    closeEditor();
-    return;
+  node.append(main);
+  if (opts.trail) {
+    const trail = el("div", "trail");
+    trail.append(...(Array.isArray(opts.trail) ? opts.trail : [opts.trail]));
+    node.append(trail);
   }
-  if (state.config.apps) delete state.config.apps[ed.key];
-  persist("Rule removed");
+  return node;
 }
 
-async function persist(message) {
-  closeEditor();
-  await guard("Save failed", async () => {
-    await api.save(state.config);
-    await loadAll(false);
-    toast(message, "ok");
-  });
+function card(children) {
+  const box = el("div", "card");
+  const list = el("div", "list");
+  list.append(...children);
+  box.append(list);
+  return box;
 }
 
-/* ---- raw editor ---- */
-
-function renderRaw() {
-  $("raw-path").textContent = (state.status && state.status.config) || "";
-  const present = state.status && state.status.config_present;
-  $("raw-json").value = JSON.stringify(state.config, null, 2);
-  $("raw-json").dataset.present = present ? "1" : "";
+function note(text) {
+  return el("p", "note", text);
 }
 
-async function applyRaw() {
-  let parsed;
+/* ---- theme ---- */
+
+function applyTheme() {
+  let theme = "system";
   try {
-    parsed = JSON.parse($("raw-json").value);
+    theme = localStorage.getItem(THEME_KEY) || "system";
   } catch (e) {
-    toast("Not valid JSON: " + e.message, "bad");
-    return;
+    /* a WebView with storage off still gets the system theme */
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    toast("The config has to be a JSON object", "bad");
-    return;
+  if (theme === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", theme);
+  return theme;
+}
+
+function setTheme(theme) {
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch (e) {
+    /* not fatal: the choice just will not survive a reload */
   }
-  await guard("Save failed", async () => {
-    await api.save(parsed);
-    await loadAll(false);
-    toast("Config applied", "ok");
+  applyTheme();
+  render();
+}
+
+/* ---- writing the config ---- */
+
+/* Write through on every change: the tool validates, keeps one .bak and pushes
+ * to the kernel in the same step, so what is on screen is what the kernel has. */
+async function persist() {
+  await api.save(state.config);
+}
+
+/* Mutate a copy, write it, and keep it only if the tool took it: a refused
+ * write must not leave the page showing a config the kernel never got. */
+async function change(label, mutate) {
+  const before = JSON.parse(JSON.stringify(state.config));
+  mutate(state.config);
+  await guard(label, async () => {
+    try {
+      await persist();
+      toast("Saved");
+    } catch (e) {
+      /* Put the old config back so the screen and the file agree again. */
+      state.config = before;
+      throw e;
+    }
   });
+  /* Repaint on both paths: after a refused write a switch would otherwise sit
+   * in the position the tap put it, which is not the position the file has. */
+  render();
 }
 
 /* ---- loading ---- */
 
-function normalizeConfig(answer) {
-  let config = answer && answer.config ? answer.config : {};
-  if (typeof config !== "object" || Array.isArray(config)) config = {};
-  if (!config.version) config.version = 2;
-  if (!config.mode) config.mode = "blacklist";
-  if (!config.apps || typeof config.apps !== "object") config.apps = {};
-  if (!config.templates || typeof config.templates !== "object")
-    config.templates = {};
-  return config;
-}
-
-async function loadAll(withPackages) {
-  const [status, config] = await Promise.all([api.status(), api.config()]);
-  state.status = status;
-  state.config = normalizeConfig(config);
-  if (withPackages || !state.packages.length) {
-    const packs = await api.packages();
-    state.packages = (packs && packs.packages) || [];
-    state.packages.sort((a, b) => a.name.localeCompare(b.name));
+async function load() {
+  try {
+    const [status, packages, config] = await Promise.all([
+      api.status(),
+      api.packages(),
+      api.config(),
+    ]);
+    state.status = status;
+    state.packages = packages.ok ? packages.packages || [] : [];
+    state.config = normalize(config.config || {});
+    state.failed = packages.ok ? null : "install: package list unavailable";
+    api.version().then((v) => {
+      state.version = v;
+      /* The version arrives after the first paint; the two screens that show it
+       * are repainted so it is not left reading "unknown". */
+      const now = screen().screen;
+      if (now === "about" || now === "home") render();
+    });
+  } catch (e) {
+    state.failed = e.message;
   }
-  state.ready = true;
-  renderStatus();
-  renderApps();
-  renderTemplates();
-  renderRaw();
+  state.loaded = true;
+  render();
 }
 
-/* ---- wiring ---- */
-
-function switchTab(name) {
-  for (const tab of document.querySelectorAll(".tab"))
-    tab.classList.toggle("active", tab.dataset.tab === name);
-  for (const panel of document.querySelectorAll(".panel"))
-    panel.classList.toggle("active", panel.id === "tab-" + name);
+function normalize(config) {
+  const out = config && typeof config === "object" ? config : {};
+  if (!out.version) out.version = 2;
+  if (!out.mode) out.mode = "blacklist";
+  if (!out.hide_system) out.hide_system = false;
+  if (!out.templates || typeof out.templates !== "object") out.templates = {};
+  if (!out.apps || typeof out.apps !== "object") out.apps = {};
+  return out;
 }
 
-function init() {
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => switchTab(tab.dataset.tab));
-  });
+/* ---- rendering ---- */
 
-  $("refresh").addEventListener("click", () =>
-    guard("Refresh failed", () => loadAll(true)),
-  );
-  $("sync-now").addEventListener("click", () =>
-    guard("Sync failed", async () => {
-      await loadAll(false);
-      toast("Re-synced", "ok");
-    }),
-  );
+function render() {
+  const app = $("app");
+  app.replaceChildren();
 
-  $("app-search").addEventListener("input", renderApps);
-  $("app-filter").addEventListener("change", renderApps);
+  const s = screen();
+  const bar = el("header", "appbar");
+  const isHome = s.screen === "home";
+  if (!isHome) {
+    const b = el("button", "icon-btn");
+    b.type = "button";
+    b.title = "Back";
+    b.append(icon("back"));
+    b.addEventListener("click", back);
+    bar.append(b);
+  }
+  bar.append(el("h1", isHome ? "lead-title" : null, titleFor(s)));
+  const actions = actionsFor(s);
+  for (const a of actions) {
+    const b = el("button", "icon-btn");
+    b.type = "button";
+    b.title = a.title;
+    b.append(icon(a.icon));
+    b.addEventListener("click", a.onClick);
+    bar.append(b);
+  }
+  app.append(bar);
 
-  $("tpl-add").addEventListener("click", () => {
-    const name = $("tpl-name").value.trim();
-    if (!name) return;
-    state.config.templates = state.config.templates || {};
-    if (state.config.templates[name]) {
-      toast("That template already exists", "bad");
-      return;
-    }
-    state.config.templates[name] = [];
-    $("tpl-name").value = "";
-    openTemplate(name);
-  });
+  const body = el("main", "screen");
+  app.append(body);
 
-  $("raw-load").addEventListener("click", () =>
-    guard("Reload failed", async () => {
-      await loadAll(false);
-      toast("Reloaded from file", "ok");
-    }),
-  );
-  $("raw-apply").addEventListener("click", applyRaw);
-
-  $("editor-close").addEventListener("click", closeEditor);
-  $("editor-save").addEventListener("click", saveEditor);
-  $("editor-remove").addEventListener("click", removeEditor);
-  $("editor-search").addEventListener("input", renderEditor);
-  $("editor").addEventListener("click", (e) => {
-    if (e.target === $("editor")) closeEditor();
-  });
-
-  if (!hasRoot()) {
-    toast("Open this page from the KernelSU manager", "bad");
-    $("status-cards").replaceChildren(
-      el("div", "card bad", "This page needs the KernelSU manager (ksu) to run sync-tool."),
-    );
+  if (!state.loaded) {
+    body.append(el("div", "empty", "Loading..."));
+    return;
+  }
+  if (state.failed && !state.config) {
+    body.append(el("div", "empty", state.failed));
     return;
   }
 
-  guard("Load failed", () => loadAll(true));
+  const view = {
+    home: viewHome,
+    apps: viewApps,
+    app: viewApp,
+    templates: viewTemplates,
+    template: viewTemplate,
+    picker: viewPicker,
+    settings: viewSettings,
+    about: viewAbout,
+    raw: viewRaw,
+    backup: viewBackup,
+    help: viewHelp,
+  }[s.screen];
+
+  if (view) view(body, s.param);
 }
 
-document.addEventListener("DOMContentLoaded", init);
+function titleFor(s) {
+  switch (s.screen) {
+    case "home":
+      return "HMA UID Fake";
+    case "apps":
+      return "Manage apps";
+    case "app":
+      return "App rule";
+    case "templates":
+      return "Templates";
+    case "template":
+      return s.param || "Template";
+    case "picker":
+      return s.param && s.param.title ? s.param.title : "Select apps";
+    case "settings":
+      return "Settings";
+    case "about":
+      return "About";
+    case "raw":
+      return "Raw config";
+    case "backup":
+      return "Backup & restore";
+    case "help":
+      return "How it works";
+    default:
+      return "HMA UID Fake";
+  }
+}
+
+function actionsFor(s) {
+  if (s.screen === "home") {
+    return [
+      {
+        title: "Settings",
+        icon: "gear",
+        onClick: () => go("settings"),
+      },
+    ];
+  }
+  return [];
+}
+
+/* ---- home ---- */
+
+function viewHome(body) {
+  const hero = el("div", "hero");
+  hero.append(el("h2", null, "HMA UID Fake"));
+  hero.append(
+    el("p", null, "Kernel-side uid guard. Apps you hide here look uninstalled."),
+  );
+  body.append(hero);
+
+  body.append(statusCard());
+
+  const rules = Object.keys(state.config.apps || {}).length;
+  const templates = Object.keys(state.config.templates || {}).length;
+
+  body.append(
+    card([
+      row({
+        lead: leadIcon("apps"),
+        title: "Manage apps",
+        sub: rules ? rules + " app" + (rules === 1 ? "" : "s") + " with a rule" : "no rules yet",
+        trail: [icon("next")],
+        onClick: () => go("apps"),
+      }),
+      row({
+        lead: leadIcon("layers"),
+        title: "Templates",
+        sub: templates
+          ? templates + " template" + (templates === 1 ? "" : "s")
+          : "no templates yet",
+        trail: [icon("next")],
+        onClick: () => go("templates"),
+      }),
+    ]),
+  );
+
+  body.append(
+    card([
+      row({
+        lead: leadIcon("save"),
+        title: "Backup & restore",
+        sub: "copy the config, paste one back",
+        trail: [icon("next")],
+        onClick: () => go("backup"),
+      }),
+      row({
+        lead: leadIcon("help"),
+        title: "How it works",
+        sub: "what this does and does not cover",
+        trail: [icon("next")],
+        onClick: () => go("help"),
+      }),
+      row({
+        lead: leadIcon("gear"),
+        title: "Settings",
+        sub: "theme, raw config",
+        trail: [icon("next")],
+        onClick: () => go("settings"),
+      }),
+      row({
+        lead: leadIcon("info"),
+        title: "About",
+        sub: state.version ? "version " + state.version : "module information",
+        trail: [icon("next")],
+        onClick: () => go("about"),
+      }),
+    ]),
+  );
+}
+
+function leadIcon(name) {
+  const box = el("div", "lead");
+  box.append(icon(name));
+  return box;
+}
+
+function statusCard() {
+  const box = el("div", "card pad");
+  const st = state.status;
+  if (!st) {
+    box.append(el("div", "empty", "Kernel status unavailable"));
+    return box;
+  }
+
+  const head = el("div", "row");
+  head.style.padding = "0 0 6px";
+  const lead = el("div", "lead");
+  lead.append(icon("shield"));
+  head.append(lead, el("div", "main"));
+  const main = head.querySelector(".main");
+  main.append(el("div", "title", "Kernel module"));
+  main.append(
+    el(
+      "div",
+      "sub",
+      st.kernel ? "answering over kaux" : st.kernel_note || "not answering",
+    ),
+  );
+  box.append(head);
+
+  const kv = (k, v) => {
+    const line = el("div", "kv");
+    line.append(el("span", "k", k), el("span", "v", v));
+    return line;
+  };
+
+  box.append(kv("Rules pushed", String(st.rules)));
+  box.append(kv("Rule source", st.source === "none" ? "none (idle)" : st.source));
+  if (st.kernel) {
+    box.append(
+      kv("Hidden uids", st.kernel.native + " native, " + st.kernel.compat + " compat"),
+    );
+    box.append(kv("APK inodes", String(st.kernel.apk_inodes)));
+    if (st.kernel.summary) box.append(kv("Summary", st.kernel.summary));
+  }
+  box.append(kv("Config", st.config + (st.config_present ? "" : " (absent)")));
+  return box;
+}
+
+/* ---- app list ---- */
+
+function filteredPackages() {
+  const q = state.query.trim().toLowerCase();
+  let list = state.packages.slice();
+  if (state.filter === "rules") list = list.filter((p) => entryOf(p.name));
+  else if (state.filter === "system") list = list.filter((p) => p.system);
+  else if (state.filter === "apps") list = list.filter((p) => !p.system);
+  if (q) {
+    list = list.filter(
+      (p) => p.name.toLowerCase().includes(q) || String(p.uid).includes(q),
+    );
+  }
+  const key = state.sort;
+  list.sort((a, b) => (a[key] > b[key] ? 1 : a[key] < b[key] ? -1 : 0));
+  if (state.reverse) list.reverse();
+  return list;
+}
+
+function viewApps(body) {
+  body.append(
+    searchBar(state.query, "Search package or uid", (v) => {
+      state.query = v;
+      renderList();
+    }),
+  );
+
+  body.append(
+    chips(
+      [
+        { id: "all", label: "All" },
+        { id: "rules", label: "With rule" },
+        { id: "apps", label: "User" },
+        { id: "system", label: "System" },
+      ],
+      state.filter,
+      (id) => {
+        state.filter = id;
+        render();
+      },
+    ),
+  );
+
+  body.append(el("div", "list", null));
+  renderList();
+}
+
+/* Only the list is rebuilt while typing, so the field keeps its focus. */
+function renderList() {
+  const holder = document.querySelector(".list");
+  if (!holder) return;
+  holder.replaceChildren();
+
+  const list = filteredPackages();
+  if (!state.packages.length) {
+    holder.append(el("div", "empty", "No packages. Is the module installed?"));
+    return;
+  }
+  if (!list.length) {
+    holder.append(el("div", "empty", "Nothing matches"));
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const p of list) {
+    const rule = entryOf(p.name);
+    const title = [document.createTextNode(p.name)];
+    if (rule) title.push(el("span", "badge", " rule"));
+    frag.append(
+      row({
+        lead: avatar(p.name),
+        title: title,
+        sub: "uid " + p.uid + (p.system ? " · system" : "") + (rule ? " · " + entrySummary(p.name) : ""),
+        subMono: true,
+        trail: [
+          switch_(!!rule, (on) => toggleRule(p.name, on)),
+        ],
+        onClick: () => go("app", p.name),
+      }),
+    );
+  }
+  holder.append(frag);
+}
+
+async function toggleRule(pkg, on) {
+  if (on) {
+    await change("Add rule", (c) => {
+      if (!c.apps[pkg]) c.apps[pkg] = { hide: [] };
+    });
+    /* A rule that hides nothing does nothing, so open it right away -- but a
+     * refused write has just been rolled back, and walking into a screen for a
+     * rule the file does not have is worse than staying put. */
+    if (entryOf(pkg)) go("app", pkg);
+  } else {
+    await change("Remove rule", (c) => {
+      delete c.apps[pkg];
+    });
+  }
+}
+
+/* ---- one app ---- */
+
+function viewApp(body, pkg) {
+  const info = pkgInfo(pkg);
+  const entry = entryOf(pkg);
+
+  const head = el("div", "card pad");
+  const hr = el("div", "row");
+  hr.style.padding = "0";
+  hr.append(avatar(pkg), el("div", "main"));
+  const hm = hr.querySelector(".main");
+  hm.append(el("div", "title mono", pkg));
+  hm.append(
+    el(
+      "div",
+      "sub",
+      info
+        ? "uid " + info.uid + (info.system ? " · system" : " · user") + " app"
+        : "not in the package list",
+    ),
+  );
+  head.append(hr);
+  if (info && info.code_dir) head.append(el("div", "sub mono", info.code_dir));
+  body.append(head);
+
+  if (!entry) {
+    body.append(el("div", "empty", "No rule for this app."));
+    const bar = el("div", "actionbar");
+    const add = el("button", "btn", "Add rule");
+    add.type = "button";
+    add.addEventListener("click", async () => {
+      await change("Add rule", (c) => {
+        c.apps[pkg] = { hide: [] };
+      });
+    });
+    bar.append(add);
+    body.append(bar);
+    return;
+  }
+
+  /* mode */
+  const modeCard = el("div", "card pad");
+  modeCard.append(el("div", "section-title", "Mode"));
+  const seg = el("div", "segmented");
+  for (const m of [
+    { id: "default", label: "Default" },
+    { id: "blacklist", label: "Blacklist" },
+    { id: "whitelist", label: "Whitelist" },
+  ]) {
+    const b = el("button", null, m.label);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String((entry.mode || "default") === m.id));
+    b.addEventListener("click", () =>
+      change("Mode", (c) => {
+        if (m.id === "default") delete c.apps[pkg].mode;
+        else c.apps[pkg].mode = m.id;
+      }),
+    );
+    seg.append(b);
+  }
+  modeCard.append(seg);
+  modeCard.append(
+    note(
+      "Default follows the module-wide mode (" +
+        state.config.mode +
+        "). Blacklist hides what is listed; whitelist hides everything except what is listed.",
+    ),
+  );
+  body.append(modeCard);
+
+  /* switches */
+  body.append(
+    card([
+      row({
+        lead: leadIcon("shield"),
+        title: "Hide everything",
+        sub: "this app sees no other app at all",
+        trail: [
+          switch_(!!entry.hide_all, (on) =>
+            change("Hide everything", (c) => {
+              if (on) c.apps[pkg].hide_all = true;
+              else delete c.apps[pkg].hide_all;
+            }),
+          ),
+        ],
+      }),
+      row({
+        lead: leadIcon("filter"),
+        title: "Include system apps",
+        sub: "hide system apps from it too",
+        trail: [
+          switch_(!!entry.hide_system, (on) =>
+            change("Include system apps", (c) => {
+              if (on) c.apps[pkg].hide_system = true;
+              else delete c.apps[pkg].hide_system;
+            }),
+          ),
+        ],
+      }),
+    ]),
+  );
+
+  /* hidden list + templates */
+  body.append(
+    card([
+      row({
+        lead: leadIcon("apps"),
+        title: "Hidden apps",
+        sub: (entry.hide || []).length
+          ? (entry.hide || []).length + " listed"
+          : "none listed",
+        trail: [icon("next")],
+        onClick: () =>
+          go("picker", {
+            title: "Hidden apps",
+            selected: entry.hide || [],
+            onDone: async (picked) => {
+              await change("Hidden apps", (c) => {
+                if (picked.length) c.apps[pkg].hide = picked;
+                else delete c.apps[pkg].hide;
+              });
+              back();
+            },
+          }),
+      }),
+      row({
+        lead: leadIcon("layers"),
+        title: "Templates",
+        sub: (entry.templates || []).length
+          ? (entry.templates || []).join(", ")
+          : "none",
+        trail: [icon("next")],
+        onClick: () =>
+          go("picker", {
+            title: "Templates",
+            names: Object.keys(state.config.templates || {}),
+            selected: entry.templates || [],
+            onDone: async (picked) => {
+              await change("Templates", (c) => {
+                if (picked.length) c.apps[pkg].templates = picked;
+                else delete c.apps[pkg].templates;
+              });
+              back();
+            },
+          }),
+      }),
+    ]),
+  );
+
+  const bar = el("div", "actionbar");
+  const del = el("button", "btn danger", "Remove rule");
+  del.type = "button";
+  del.addEventListener("click", async () => {
+    await change("Remove rule", (c) => {
+      delete c.apps[pkg];
+    });
+    back();
+  });
+  bar.append(del);
+  body.append(bar);
+}
+
+/* ---- templates ---- */
+
+function viewTemplates(body) {
+  const names = Object.keys(state.config.templates || {}).sort();
+  if (!names.length) {
+    body.append(
+      el("div", "empty", "No templates yet. A template is a named list of apps you can give to many rules."),
+    );
+  } else {
+    body.append(
+      card(
+        names.map((name) =>
+          row({
+            lead: leadIcon("layers"),
+            title: name,
+            sub:
+              templateCount(name) + " app" + (templateCount(name) === 1 ? "" : "s"),
+            trail: [icon("next")],
+            onClick: () => go("template", name),
+          }),
+        ),
+      ),
+    );
+  }
+
+  const bar = el("div", "actionbar");
+  const add = el("button", "btn", "New template");
+  add.type = "button";
+  add.addEventListener("click", () => newTemplate());
+  bar.append(add);
+  body.append(bar);
+}
+
+function newTemplate() {
+  sheet({
+    title: "New template",
+    body: (wrap) => {
+      const input = el("input", "field");
+      input.placeholder = "name, e.g. banking";
+      wrap.append(input);
+      setTimeout(() => input.focus(), 50);
+      return () => input.value.trim();
+    },
+    confirm: "Create",
+    onConfirm: async (readName) => {
+      const name = readName();
+      if (!name) return true;
+      if (state.config.templates[name]) {
+        toast("A template with that name already exists", "bad");
+        return true;
+      }
+      await change("New template", (c) => {
+        c.templates[name] = [];
+        c.apps = c.apps || {};
+      });
+      go("template", name);
+      return false;
+    },
+  });
+}
+
+function viewTemplate(body, name) {
+  const members = state.config.templates[name] || [];
+  if (!state.config.templates[name]) {
+    body.append(el("div", "empty", "That template is gone."));
+    return;
+  }
+
+  const head = el("div", "card pad");
+  head.append(el("div", "section-title", "Name"));
+  const input = el("input", "field");
+  input.value = name;
+  input.addEventListener("change", async () => {
+    const next = input.value.trim();
+    if (!next || next === name) {
+      input.value = name;
+      return;
+    }
+    if (state.config.templates[next]) {
+      toast("A template with that name already exists", "bad");
+      input.value = name;
+      return;
+    }
+    await change("Rename", (c) => {
+      c.templates[next] = c.templates[name];
+      delete c.templates[name];
+      /* Rules point at templates by name, so a rename has to follow through or
+       * they would be left pointing at nothing. */
+      for (const caller of Object.keys(c.apps || {})) {
+        const list = c.apps[caller].templates;
+        if (Array.isArray(list) && list.includes(name)) {
+          c.apps[caller].templates = list.map((t) => (t === name ? next : t));
+        }
+      }
+    });
+    state.stack[state.stack.length - 1].param = next;
+    render();
+  });
+  head.append(input);
+  body.append(head);
+
+  body.append(
+    card([
+      row({
+        lead: leadIcon("apps"),
+        title: "Members",
+        sub: members.length
+          ? members.length + " app" + (members.length === 1 ? "" : "s")
+          : "none yet",
+        trail: [icon("next")],
+        onClick: () =>
+          go("picker", {
+            title: "Members",
+            selected: members,
+            onDone: async (picked) => {
+              await change("Members", (c) => {
+                c.templates[name] = picked;
+              });
+              back();
+            },
+          }),
+      }),
+    ]),
+  );
+
+  if (members.length) {
+    body.append(
+      card(
+        members.map((p) =>
+          row({
+            lead: avatar(p),
+            title: p,
+            subMono: true,
+            sub: pkgInfo(p) ? "uid " + pkgInfo(p).uid : "",
+            trail: [icon("next")],
+            onClick: () => go("app", p),
+          }),
+        ),
+      ),
+    );
+  }
+
+  const bar = el("div", "actionbar");
+  const del = el("button", "btn danger", "Delete template");
+  del.type = "button";
+  del.addEventListener("click", async () => {
+    await change("Delete template", (c) => {
+      delete c.templates[name];
+      for (const caller of Object.keys(c.apps || {})) {
+        const list = c.apps[caller].templates;
+        if (Array.isArray(list)) {
+          const kept = list.filter((t) => t !== name);
+          if (kept.length) c.apps[caller].templates = kept;
+          else delete c.apps[caller].templates;
+        }
+      }
+    });
+    back();
+  });
+  bar.append(del);
+  body.append(bar);
+}
+
+/* ---- picker ---- */
+
+/* One screen serves both "which apps does this rule hide" and "who is in this
+ * template": the second picks names, the first picks packages. */
+function viewPicker(body, param) {
+  const selected = new Set(param.selected || []);
+  const byName = !!param.names;
+  const items = byName
+    ? param.names.slice().sort().map((n) => ({ name: n, uid: null, system: false }))
+    : state.packages;
+
+  const query = el("div");
+  body.append(
+    searchBar("", byName ? "Search template" : "Search package or uid", (v) => {
+      paint(v);
+    }),
+  );
+
+  const holder = el("div", "list");
+  body.append(holder);
+
+  function paint(q) {
+    const needle = (q || "").trim().toLowerCase();
+    const list = items.filter(
+      (p) =>
+        !needle ||
+        p.name.toLowerCase().includes(needle) ||
+        String(p.uid || "").includes(needle),
+    );
+    holder.replaceChildren();
+    if (!list.length) {
+      holder.append(el("div", "empty", "Nothing matches"));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const p of list) {
+      frag.append(
+        row({
+          lead: byName ? leadIcon("layers") : avatar(p.name),
+          title: p.name,
+          sub: p.uid == null ? "" : "uid " + p.uid + (p.system ? " · system" : ""),
+          subMono: true,
+          trail: [
+            switch_(selected.has(p.name), (on) => {
+              if (on) selected.add(p.name);
+              else selected.delete(p.name);
+              count.textContent = selected.size + " selected";
+            }),
+          ],
+        }),
+      );
+    }
+    holder.append(frag);
+  }
+
+  const count = el("div", "note", selected.size + " selected");
+  body.append(count);
+
+  const bar = el("div", "actionbar");
+  const clear = el("button", "btn tonal", "Clear");
+  clear.type = "button";
+  clear.addEventListener("click", () => {
+    selected.clear();
+    count.textContent = "0 selected";
+    paint("");
+  });
+  const done = el("button", "btn", "Done");
+  done.type = "button";
+  done.addEventListener("click", () => param.onDone([...selected]));
+  bar.append(clear, done);
+  body.append(bar);
+
+  paint("");
+}
+
+/* ---- settings, raw, backup, about, help ---- */
+
+function viewSettings(body) {
+  const theme = applyTheme();
+  const box = el("div", "card pad");
+  box.append(el("div", "section-title", "Theme"));
+  const seg = el("div", "segmented");
+  for (const t of [
+    { id: "system", label: "System" },
+    { id: "light", label: "Light" },
+    { id: "dark", label: "Dark" },
+  ]) {
+    const b = el("button", null, t.label);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(theme === t.id));
+    b.addEventListener("click", () => setTheme(t.id));
+    seg.append(b);
+  }
+  box.append(seg);
+  body.append(box);
+
+  const def = el("div", "card pad");
+  def.append(el("div", "section-title", "Default for apps without a mode of their own"));
+  const modeSeg = el("div", "segmented");
+  for (const m of [
+    { id: "blacklist", label: "Blacklist" },
+    { id: "whitelist", label: "Whitelist" },
+  ]) {
+    const b = el("button", null, m.label);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(state.config.mode === m.id));
+    b.addEventListener("click", () =>
+      change("Default mode", (c) => {
+        c.mode = m.id;
+      }),
+    );
+    modeSeg.append(b);
+  }
+  def.append(modeSeg);
+  def.append(
+    note(
+      "Blacklist hides the apps a rule lists. Whitelist hides every app except the ones a rule lists -- an app with a rule and nothing listed is hidden from everything, so check the rules before switching.",
+    ),
+  );
+  def.append(
+    row({
+      lead: leadIcon("filter"),
+      title: "Hide system apps too",
+      sub: "off by default: a framework package made absent breaks a device",
+      trail: [
+        switch_(!!state.config.hide_system, (on) =>
+          change("Hide system apps", (c) => {
+            c.hide_system = on;
+          }),
+        ),
+      ],
+    }),
+  );
+  body.append(def);
+
+  body.append(
+    card([
+      row({
+        lead: leadIcon("code"),
+        title: "Raw config",
+        sub: "edit the JSON by hand",
+        trail: [icon("next")],
+        onClick: () => go("raw"),
+      }),
+      row({
+        lead: leadIcon("save"),
+        title: "Backup & restore",
+        sub: "copy or paste a config",
+        trail: [icon("next")],
+        onClick: () => go("backup"),
+      }),
+      row({
+        lead: leadIcon("info"),
+        title: "About",
+        trail: [icon("next")],
+        onClick: () => go("about"),
+      }),
+    ]),
+  );
+
+  body.append(
+    note(
+      "Config format version " +
+        (state.config.version || 2) +
+        ". Every change is written through sync-tool, which keeps one .bak and pushes the new policy to the kernel in the same step.",
+    ),
+  );
+}
+
+function viewRaw(body) {
+  const area = el("textarea", "field");
+  area.spellcheck = false;
+  area.value = JSON.stringify(state.config, null, 2);
+  body.append(area);
+
+  const bar = el("div", "actionbar");
+  const revert = el("button", "btn tonal", "Revert");
+  revert.type = "button";
+  revert.addEventListener("click", () => {
+    area.value = JSON.stringify(state.config, null, 2);
+  });
+  const save = el("button", "btn", "Validate & save");
+  save.type = "button";
+  save.addEventListener("click", async () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(area.value);
+    } catch (e) {
+      toast("Not valid JSON: " + e.message, "bad");
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      toast("The config has to be a JSON object", "bad");
+      return;
+    }
+    await change("Save", (c) => {
+      for (const k of Object.keys(c)) delete c[k];
+      Object.assign(c, normalize(parsed));
+    });
+  });
+  bar.append(revert, save);
+  body.append(bar);
+}
+
+function viewBackup(body) {
+  const area = el("textarea", "field");
+  area.spellcheck = false;
+  area.value = JSON.stringify(state.config, null, 2);
+  area.readOnly = true;
+  area.style.minHeight = "160px";
+  body.append(el("div", "section-title", "Current config"));
+  body.append(area);
+
+  const copyRow = el("div", "btnrow");
+  const copy = el("button", "btn tonal", "Copy");
+  copy.type = "button";
+  copy.addEventListener("click", () => {
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (e) {
+      ok = false;
+    }
+    if (!ok && navigator.clipboard) {
+      navigator.clipboard.writeText(area.value).then(
+        () => toast("Copied"),
+        () => toast("Copy failed", "bad"),
+      );
+      return;
+    }
+    toast(ok ? "Copied" : "Copy failed", ok ? null : "bad");
+  });
+  const path = el("button", "btn tonal", "Copy path");
+  path.type = "button";
+  path.addEventListener("click", () => {
+    const p = (state.status && state.status.config) || "/data/adb/hma-uidfake/config.json";
+    if (navigator.clipboard) navigator.clipboard.writeText(p);
+    toast(p);
+  });
+  copyRow.append(copy, path);
+  body.append(copyRow);
+
+  body.append(el("div", "section-title", "Restore"));
+  const paste = el("textarea", "field");
+  paste.spellcheck = false;
+  paste.placeholder = "paste a config here";
+  paste.style.minHeight = "160px";
+  body.append(paste);
+
+  const bar = el("div", "actionbar");
+  const restore = el("button", "btn", "Validate & write");
+  restore.type = "button";
+  restore.addEventListener("click", async () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(paste.value);
+    } catch (e) {
+      toast("Not valid JSON: " + e.message, "bad");
+      return;
+    }
+    await change("Restore", (c) => {
+      for (const k of Object.keys(c)) delete c[k];
+      Object.assign(c, normalize(parsed));
+    });
+  });
+  bar.append(restore);
+  body.append(bar);
+}
+
+function viewAbout(body) {
+  const box = el("div", "card pad");
+  const hs = el("div", "row");
+  hs.style.padding = "0";
+  const lead = el("div", "lead");
+  lead.append(icon("shield"));
+  hs.append(lead, el("div", "main"));
+  const hm = hs.querySelector(".main");
+  hm.append(el("div", "title", "HMA UID Fake"));
+  hm.append(el("div", "sub", state.version ? "version " + state.version : "version unknown"));
+  box.append(hs);
+  box.append(
+    note(
+      "A KernelSU kernel module: a hidden app's uid is made to look like it does not exist, so another app scanning uids does not find it.",
+    ),
+  );
+  body.append(box);
+
+  body.append(
+    card([
+      row({
+        lead: leadIcon("info"),
+        title: "Source",
+        sub: REPO_URL.replace("https://", ""),
+        subMono: true,
+        onClick: () => window.open(REPO_URL, "_blank"),
+      }),
+      row({
+        lead: leadIcon("info"),
+        title: "Licence",
+        sub: "GPL-2.0",
+        subMono: true,
+      }),
+      row({
+        lead: leadIcon("help"),
+        title: "How it works",
+        trail: [icon("next")],
+        onClick: () => go("help"),
+      }),
+    ]),
+  );
+
+  body.append(
+    note(
+      "The screen layout follows the HMA-OSS app because these settings are familiar in that shape. It is an independent reimplementation for this module, not a copy of its code.",
+    ),
+  );
+}
+
+function viewHelp(body) {
+  const box = el("div", "card pad");
+  box.append(el("div", "section-title", "What it does"));
+  box.append(
+    note(
+      "For an app you name as a caller, the kernel reports the uids you list as free, so a scan of /proc or a uid lookup does not turn them up.",
+    ),
+  );
+  box.append(el("div", "section-title", "What it does not do"));
+  box.append(
+    note(
+      "It is a kernel-side guard. It does not hook the Java framework, so an app that asks PackageManager, ActivityManager or a ContentProvider for an installed package can still be told it exists. Hiding an icon, hiding from the launcher and per-hook switches are not implemented here. Treat this as one layer, not a complete hiding system.",
+    ),
+  );
+  box.append(el("div", "section-title", "Where the config lives"));
+  box.append(
+    note(
+      ((state.status && state.status.config) || "/data/adb/hma-uidfake/config.json") +
+        " -- outside the modules directory, so a module update does not replace it. One .bak is kept beside it.",
+    ),
+  );
+  body.append(box);
+}
+
+/* ---- sheet ---- */
+
+function sheet(opts) {
+  const root = $("dialog");
+  root.replaceChildren();
+  root.classList.remove("hidden");
+  root.addEventListener("click", (ev) => {
+    if (ev.target === root) closeSheet();
+  });
+
+  const box = el("div", "sheet");
+  box.append(el("div", "grabber"));
+  box.append(el("h3", null, opts.title));
+  if (opts.text) box.append(el("p", null, opts.text));
+
+  const wrap = el("div");
+  const read = opts.body ? opts.body(wrap) : null;
+  box.append(wrap);
+
+  const bar = el("div", "btnrow");
+  const cancel = el("button", "btn tonal", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", closeSheet);
+  const ok = el("button", "btn", opts.confirm || "OK");
+  ok.type = "button";
+  ok.addEventListener("click", async () => {
+    const keep = await opts.onConfirm(read);
+    if (!keep) closeSheet();
+  });
+  bar.append(cancel, ok);
+  box.append(bar);
+
+  root.append(box);
+}
+
+function closeSheet() {
+  $("dialog").classList.add("hidden");
+  $("dialog").replaceChildren();
+}
+
+/* ---- boot ---- */
+
+applyTheme();
+render();
+load();

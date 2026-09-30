@@ -1,12 +1,20 @@
 <!DOCTYPE html>
 <!--
-  The module's own UI, served by the KernelSU/Magisk manager from webroot/.
+  The module's WebUI, served by the KernelSU manager out of module/webroot/.
 
-  It does no thinking of its own: every piece of data comes from sync-tool
-  (--status, --packages, --get-config) and every change goes back through it
-  (--set-config), so the page and the running policy can never disagree about
-  which format a file is in. The tool is the one place that reads and writes the
-  config, and it validates before it writes.
+  It decides nothing on its own. Every read is a sync-tool command
+  (--status, --packages, --get-config) and every write is --set-config, so the
+  page and the running policy cannot disagree about which format a file is in:
+  the tool is the only thing that reads or writes the config, and it validates
+  before it writes.
+
+  The screens follow the layout of the HMA-OSS app (a home list over sub-screens,
+  a searchable app list, per-app settings, templates), because that is the shape
+  these settings are already familiar in. It is a reimplementation, not a copy:
+  HMA-OSS is AGPL-3.0 and this module is GPL-2.0, and nothing here is derived
+  from its source. Screens it has that a kernel-side uid guard cannot honour --
+  icon and launcher hiding, per-hook switches, logs, accessibility -- are left
+  out rather than shown as dead switches.
 -->
 <html lang="en">
   <head>
@@ -20,94 +28,12 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <h1>HMA UID Fake</h1>
-        <p class="sub" id="subtitle">kernel-side uid guard</p>
-      </div>
-      <button id="refresh" class="icon-btn" title="Refresh">&#x21bb;</button>
-    </header>
-
-    <nav class="tabs">
-      <button class="tab active" data-tab="status">Status</button>
-      <button class="tab" data-tab="apps">Apps</button>
-      <button class="tab" data-tab="templates">Templates</button>
-      <button class="tab" data-tab="raw">Raw</button>
-    </nav>
-
-    <main>
-      <section id="tab-status" class="panel active">
-        <div id="status-cards" class="cards"></div>
-        <div class="row">
-          <button id="sync-now" class="primary">Sync now</button>
-        </div>
-      </section>
-
-      <section id="tab-apps" class="panel">
-        <div class="row">
-          <input id="app-search" type="search" placeholder="Search packages" />
-          <select id="app-filter">
-            <option value="callers">Callers only</option>
-            <option value="user">User apps</option>
-            <option value="all">All apps</option>
-          </select>
-        </div>
-        <p class="hint" id="apps-hint"></p>
-        <ul id="app-list" class="list"></ul>
-      </section>
-
-      <section id="tab-templates" class="panel">
-        <div class="row">
-          <input id="tpl-name" placeholder="new template name" />
-          <button id="tpl-add">Add</button>
-        </div>
-        <p class="hint">
-          A template is a named list of packages. A caller that applies it hides
-          everything on it, the same way it would hide its own list.
-        </p>
-        <ul id="tpl-list" class="list"></ul>
-      </section>
-
-      <section id="tab-raw" class="panel">
-        <p class="hint" id="raw-path"></p>
-        <textarea id="raw-json" spellcheck="false"></textarea>
-        <div class="row">
-          <button id="raw-load">Reload from file</button>
-          <button id="raw-apply" class="primary">Apply</button>
-        </div>
-      </section>
-    </main>
-
-    <div id="editor" class="modal hidden">
-      <div class="modal-card">
-        <header>
-          <h2 id="editor-title">Hide targets</h2>
-          <button id="editor-close" class="icon-btn">&#x2715;</button>
-        </header>
-        <div class="row wrap">
-          <input id="editor-search" type="search" placeholder="Search targets" />
-          <label class="chk"
-            ><input type="checkbox" id="editor-all" /> Hide everything</label
-          >
-          <label class="chk"
-            ><input type="checkbox" id="editor-whitelist" /> Whitelist</label
-          >
-          <label class="chk"
-            ><input type="checkbox" id="editor-system" /> System apps</label
-          >
-        </div>
-        <p class="hint" id="editor-hint"></p>
-        <ul id="editor-list" class="list scroll"></ul>
-        <footer>
-          <button id="editor-remove" class="danger">Remove rule</button>
-          <button id="editor-save" class="primary">Done</button>
-        </footer>
-      </div>
+    <div id="app"></div>
+    <div id="snackbar" class="snackbar hidden" role="status"></div>
+    <div id="busy" class="busy hidden" aria-hidden="true">
+      <div class="spinner"></div>
     </div>
-
-    <div id="toast" class="toast hidden"></div>
-    <div id="busy" class="busy hidden"><div class="spinner"></div></div>
-
+    <div id="dialog" class="dialog-root hidden"></div>
     <script src="app.js"></script>
   </body>
 </html>

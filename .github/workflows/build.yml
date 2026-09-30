@@ -1,67 +1,138 @@
 name: build
 
+# A push, a tag or a PR builds everything, so a release and a branch tip are never missing a ko.
+# A manual run chooses: turn the ko build off to ship a userspace-only zip (a sync-tool or WebUI
+# change), or turn it on and pick the KMIs to build. Whatever is chosen, the module zip is still
+# produced -- a ko-less run packs the same module without a kernel module in ko/.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_lkm:
+        description: "Build the kernel modules (hma_uidfake.ko)"
+        default: true
+        type: boolean
+      build_all:
+        description: "Build every KMI (overrides the per-KMI toggles below)"
+        default: false
+        type: boolean
+      kmi_android12_5_10:
+        description: android12-5.10
+        default: false
+        type: boolean
+      kmi_android13_5_10:
+        description: android13-5.10
+        default: false
+        type: boolean
+      kmi_android13_5_15:
+        description: android13-5.15
+        default: false
+        type: boolean
+      kmi_android14_5_15:
+        description: android14-5.15
+        default: false
+        type: boolean
+      kmi_android14_6_1:
+        description: android14-6.1
+        default: false
+        type: boolean
+      kmi_android15_6_6:
+        description: android15-6.6
+        default: false
+        type: boolean
+      kmi_android16_6_12:
+        description: android16-6.12
+        default: false
+        type: boolean
+      kmi_android17_6_18:
+        description: android17-6.18
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer run on a branch replaces the one before it; a tag run is never cancelled, or a release
+  # could be left half published.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
-  # One job per KMI, built inside the matching DDK container.
-  lkm:
-    name: hma_uidfake.ko (${{ matrix.kmi }})
+  # Decide what the rest of the run does, so no job has to repeat the rule about the toggles.
+  select:
+    name: Select what to build
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260828
-      options: --privileged
-    strategy:
-      fail-fast: false
-      matrix:
-        kmi:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          - android16-6.12
-          - android17-6.18
+    outputs:
+      build_lkm: ${{ steps.pick.outputs.build_lkm }}
+      kmis: ${{ steps.pick.outputs.kmis }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          # The module version comes from git (tag + short hash), so the tags have to be here.
-          fetch-depth: 0
-          submodules: recursive
-      - name: Check formatting
-        run: bash scripts/check-format.sh
-      - name: Build
+      - name: Resolve the build
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          BUILD_LKM: ${{ inputs.build_lkm }}
+          BUILD_ALL: ${{ inputs.build_all }}
+          KMI_ANDROID12_5_10: ${{ inputs.kmi_android12_5_10 }}
+          KMI_ANDROID13_5_10: ${{ inputs.kmi_android13_5_10 }}
+          KMI_ANDROID13_5_15: ${{ inputs.kmi_android13_5_15 }}
+          KMI_ANDROID14_5_15: ${{ inputs.kmi_android14_5_15 }}
+          KMI_ANDROID14_6_1: ${{ inputs.kmi_android14_6_1 }}
+          KMI_ANDROID15_6_6: ${{ inputs.kmi_android15_6_6 }}
+          KMI_ANDROID16_6_12: ${{ inputs.kmi_android16_6_12 }}
+          KMI_ANDROID17_6_18: ${{ inputs.kmi_android17_6_18 }}
         run: |
           set -euo pipefail
-          KDIR="${KDIR:-/opt/ddk/kdir/${{ matrix.kmi }}}"
-          [ -f "$KDIR/Makefile" ] || { echo "no kernel tree at $KDIR"; exit 1; }
 
-          # kbuild writes objects into the M= directory, so build from a stage dir
-          # that only contains symlinks to src/ to keep the checkout clean.
-          stage="$RUNNER_TEMP/stage/${{ matrix.kmi }}"
-          mkdir -p "$stage" out
-          for f in src/*; do ln -sfn "$PWD/$f" "$stage/$(basename "$f")"; done
+          # Only a manual run chooses; everything else builds every KMI, which is what a release
+          # and a branch tip need.
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "build_lkm=true" >> "$GITHUB_OUTPUT"
+            echo "kmis=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          # CROSS_COMPILE is what a tree this old takes its target triple from; without it clang
-          # emits bitcode for the host and the LTO link says "incompatible with aarch64elf".
-          make -C "$KDIR" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- M="$stage" modules
-          llvm-strip -d "$stage/hma_uidfake.ko" || true
-          cp "$stage/hma_uidfake.ko" "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ko-${{ matrix.kmi }}
-          path: out/*.ko
-          if-no-files-found: error
+          # The ko build turned off: still pack a module, just with no ko in it.
+          if [ "$BUILD_LKM" != "true" ]; then
+            echo "build_lkm=false" >> "$GITHUB_OUTPUT"
+            echo "kmis=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # build_all forces every KMI; otherwise the per-KMI toggles decide, and no toggle keeps
+          # the previous behaviour of building everything.
+          kmis="$(jq -cn '
+            (env.BUILD_ALL == "true") as $force_all |
+            [
+              {kmi: "android12-5.10", on: (if $force_all then true else (env.KMI_ANDROID12_5_10 == "true") end)},
+              {kmi: "android13-5.10", on: (if $force_all then true else (env.KMI_ANDROID13_5_10 == "true") end)},
+              {kmi: "android13-5.15", on: (if $force_all then true else (env.KMI_ANDROID13_5_15 == "true") end)},
+              {kmi: "android14-5.15", on: (if $force_all then true else (env.KMI_ANDROID14_5_15 == "true") end)},
+              {kmi: "android14-6.1",  on: (if $force_all then true else (env.KMI_ANDROID14_6_1 == "true") end)},
+              {kmi: "android15-6.6",  on: (if $force_all then true else (env.KMI_ANDROID15_6_6 == "true") end)},
+              {kmi: "android16-6.12", on: (if $force_all then true else (env.KMI_ANDROID16_6_12 == "true") end)},
+              {kmi: "android17-6.18", on: (if $force_all then true else (env.KMI_ANDROID17_6_18 == "true") end)}
+            ] | map(select(.on).kmi) as $selected
+              | if $selected == [] then map(.kmi) else $selected end')"
+          echo "build_lkm=true" >> "$GITHUB_OUTPUT"
+          echo "kmis=$kmis" >> "$GITHUB_OUTPUT"
+
+  # One job per selected KMI, built inside the matching DDK container. Skipped when the ko build
+  # was turned off, and the pack job below is written to run either way.
+  lkm:
+    name: kernel modules
+    needs: select
+    if: needs.select.outputs.build_lkm == 'true'
+    uses: ./.github/workflows/build-lkm.yml
+    with:
+      kmis: ${{ needs.select.outputs.kmis }}
 
   pack:
     name: pack module zip
     runs-on: ubuntu-latest
-    needs: lkm
+    needs: [select, lkm]
+    # Always run unless the ko build itself failed: a skipped lkm is a ko-less pack, not an error.
+    if: always() && (needs.lkm.result == 'success' || needs.lkm.result == 'skipped')
     # The tag run publishes from this job, where the zip is: an artifact cannot
     # be searched for by a name that is certain (see the upload below), and a
     # download of it can hand the zip back unpacked.
@@ -73,7 +144,8 @@ jobs:
           fetch-depth: 0
           # lkmloader is built here, from external/lkmloader.
           submodules: recursive
-      - uses: actions/download-artifact@v8
+      - if: needs.select.outputs.build_lkm == 'true'
+        uses: actions/download-artifact@v8
         with:
           path: build/ko
           pattern: ko-*
@@ -99,9 +171,16 @@ jobs:
       - name: Configure
         run: |
           set -euo pipefail
+          # With the ko build turned off there is no ko to package: say that an empty build/ko is
+          # deliberate, so the pack still produces a userspace-only zip instead of failing.
+          allow_no_ko=""
+          if [ "${{ needs.select.outputs.build_lkm }}" != "true" ]; then
+            allow_no_ko="-DUG_ALLOW_NO_KO=ON"
+          fi
           cmake -S . -B build \
             -DUG_NDK="${{ steps.ndk.outputs.ndk-path }}" \
-            -DUG_USE_PREBUILT_KO=ON
+            -DUG_USE_PREBUILT_KO=ON \
+            $allow_no_ko
       - name: Build and pack
         run: |
           set -euo pipefail

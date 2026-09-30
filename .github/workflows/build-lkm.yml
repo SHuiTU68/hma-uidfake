@@ -1,0 +1,83 @@
+name: build lkm
+
+# The kernel modules on their own, so the caller decides whether and which ones to build. A
+# userspace-only change (sync-tool, the WebUI) does not need a ko, and building eight of them
+# to test a page is eight DDK containers for nothing.
+#
+# An empty `kmis` list means every KMI this project ships, which is what a release and a plain
+# push want; a non-empty list builds exactly those.
+on:
+  workflow_call:
+    inputs:
+      kmis:
+        description: >-
+          JSON array of the KMIs to build, e.g. ["android15-6.6"]. An empty array builds every
+          KMI this project ships.
+        required: false
+        default: "[]"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    name: Select KMI builds
+    runs-on: ubuntu-latest
+    outputs:
+      kmi: ${{ steps.pick.outputs.kmi }}
+    steps:
+      - name: Resolve the KMI list
+        id: pick
+        env:
+          KMIS: ${{ inputs.kmis }}
+        run: |
+          set -euo pipefail
+          # A caller that named KMIs gets exactly those; an empty list means everything.
+          if [ -n "$KMIS" ] && [ "$KMIS" != "[]" ]; then
+            echo "kmi=$KMIS" >> "$GITHUB_OUTPUT"
+          else
+            echo 'kmi=["android12-5.10","android13-5.10","android13-5.15","android14-5.15","android14-6.1","android15-6.6","android16-6.12","android17-6.18"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  lkm:
+    name: hma_uidfake.ko (${{ matrix.kmi }})
+    needs: select
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi: ${{ fromJSON(needs.select.outputs.kmi) }}
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260828
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The module version comes from git (tag + short hash), so the tags have to be here.
+          fetch-depth: 0
+          submodules: recursive
+      - name: Check formatting
+        run: bash scripts/check-format.sh
+      - name: Build
+        run: |
+          set -euo pipefail
+          KDIR="${KDIR:-/opt/ddk/kdir/${{ matrix.kmi }}}"
+          [ -f "$KDIR/Makefile" ] || { echo "no kernel tree at $KDIR"; exit 1; }
+
+          # kbuild writes objects into the M= directory, so build from a stage dir
+          # that only contains symlinks to src/ to keep the checkout clean.
+          stage="$RUNNER_TEMP/stage/${{ matrix.kmi }}"
+          mkdir -p "$stage" out
+          for f in src/*; do ln -sfn "$PWD/$f" "$stage/$(basename "$f")"; done
+
+          # CROSS_COMPILE is what a tree this old takes its target triple from; without it clang
+          # emits bitcode for the host and the LTO link says "incompatible with aarch64elf".
+          make -C "$KDIR" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- M="$stage" modules
+          llvm-strip -d "$stage/hma_uidfake.ko" || true
+          cp "$stage/hma_uidfake.ko" "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ko-${{ matrix.kmi }}
+          path: out/*.ko
+          if-no-files-found: error

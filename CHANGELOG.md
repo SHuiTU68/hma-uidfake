@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- The module can run on rules of its own, so HMA or HMA-OSS is no longer required to decide who is
+  hidden. It keeps its config at `/data/adb/hma-uidfake/config.json` -- outside `modules/`, where a
+  module update would not carry it away -- and the places a config can be are checked in a fixed
+  order, the module's own first. The format is `NativeRules`, beside `HmaRules` and `HmaOssRules`
+  behind the same interface: `mode` blacklist or whitelist, per-caller `hide` lists and templates,
+  `hide_all`, and `hide_system` off by default so the framework's own packages are not what
+  disappears. A version newer than the tool knows is refused rather than read with a field missing.
+
+- A WebUI, served by the KernelSU manager from `module/webroot/`. It decides nothing on its own:
+  every read is `sync-tool --status`, `--packages` or `--get-config`, and every write is
+  `--set-config`, so the page and the running policy cannot disagree about which format a file is in.
+  Each command prints one JSON document on stdout and logs only to stderr, the tool checks a write
+  exactly as the reader would before it touches the file, and the write goes through a temporary file
+  and a rename with one `.bak` kept. There is no Zygisk and no new kernel path: the user-space half is
+  the same `sync-tool` that already reads a config and pushes the pairs over `kaux`.
+
+- `scripts/rules_test.cpp` covers the native format the same way it covers the other two: the hide
+  list and templates, blacklist and whitelist, `hide_all`, the system-target default, the
+  caller-never-hides-itself rule, and the refusal of a newer version or a non-object config.
+
 ## 0.3.3
 
 - The tool reads the package database whichever form it is written in. Android 12 introduced the
